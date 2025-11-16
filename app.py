@@ -2,24 +2,35 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.decomposition import NMF
 
-# --------- CONFIG ---------
-ANIME_PATH = "anime.csv"
-RATING_PATH = "rating.csv"
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+
+# =========================================
+# CONFIG
+# =========================================
+
+ANIME_PATH = "anime.csv"    # Kaggle anime metadata
+RATING_PATH = "rating.csv"  # Kaggle user ratings
 
 st.set_page_config(
-    page_title="Anime Recommender - Hybrid + AI",
+    page_title="Anime Recommender - Hybrid + Neural CF",
     layout="wide",
 )
 
-# --------- DATA LOADING & PREPROCESSING ---------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# =========================================
+# DATA LOADING & PREPROCESSING
+# =========================================
+
 @st.cache_data
 def load_data_and_models(
     min_ratings_per_user: int = 50,
     min_ratings_per_item: int = 100,
-    max_users_for_model: int = 2000,
-    nmf_components: int = 15,
+    max_users_for_cf: int = 2000,
 ):
     # Load raw data
     anime = pd.read_csv(ANIME_PATH)
@@ -40,11 +51,10 @@ def load_data_and_models(
         & rating["anime_id"].isin(popular_items)
     ].copy()
 
-    # Recompute after first filter
+    # Optionally restrict to most active users (for speed of CF + NCF)
     user_counts2 = rating_filtered["user_id"].value_counts().sort_values(ascending=False)
-    # Limit number of users for performance
-    if len(user_counts2) > max_users_for_model:
-        keep_users = user_counts2.iloc[:max_users_for_model].index
+    if len(user_counts2) > max_users_for_cf:
+        keep_users = user_counts2.iloc[:max_users_for_cf].index
         rating_filtered = rating_filtered[rating_filtered["user_id"].isin(keep_users)]
 
     # Recompute items that survived
@@ -55,7 +65,7 @@ def load_data_and_models(
     # Keep only anime present in filtered ratings
     anime_small = anime[anime["anime_id"].isin(keep_items)].copy()
 
-    # Create user-item matrix
+    # Create user-item matrix (for CF + hybrid)
     user_item = rating_filtered.pivot_table(
         index="user_id", columns="anime_id", values="rating"
     )
@@ -83,7 +93,6 @@ def load_data_and_models(
         axis=1,
     )
 
-    # feature columns
     feature_cols = [c for c in item_features.columns if c not in ["anime_id", "name"]]
 
     # Align feature matrix with user_item columns (anime_id order)
@@ -95,20 +104,6 @@ def load_data_and_models(
     feature_cols = [c for c in item_features.columns if c not in ["anime_id", "name"]]
     item_feature_matrix = item_features.set_index("anime_id")[feature_cols]
 
-    # ===== AI-based model: NMF latent factor model =====
-    R = user_item.fillna(0).values
-    nmf_model = NMF(
-        n_components=nmf_components,
-        init="random",
-        random_state=42,
-        max_iter=300,
-    )
-    user_factors = nmf_model.fit_transform(R)
-    item_factors = nmf_model.components_
-    R_hat = np.dot(user_factors, item_factors)
-
-    nmf_pred = pd.DataFrame(R_hat, index=user_item.index, columns=user_item.columns)
-
     return (
         rating_filtered,
         anime_small,
@@ -117,7 +112,6 @@ def load_data_and_models(
         item_features,
         feature_cols,
         item_feature_matrix,
-        nmf_pred,
     )
 
 
@@ -129,17 +123,23 @@ def load_data_and_models(
     item_features,
     feature_cols,
     item_feature_matrix,
-    nmf_pred,
 ) = load_data_and_models()
 
-available_user_ids = sorted(user_item.index.tolist())
-
-# Small helper lookup (for pretty tables)
+# Lookup table for pretty printing
 anime_lookup = anime_small.set_index("anime_id")[["name", "genre", "type"]]
 
-# --------- RECOMMENDER IMPLEMENTATIONS ---------
-def get_item_based_cf_scores(user_id: int, k_neighbors: int = 20) -> pd.Series:
 
+# =========================================
+# HYBRID RECOMMENDER (item-CF + contenu)
+# =========================================
+
+def get_item_based_cf_scores(user_id: int, k_neighbors: int = 20) -> pd.Series:
+    """
+    Simple item-based CF:
+    For each candidate anime, aggregate ratings of similar animes
+    already rated by the user.
+    Returns a pandas Series: index = anime_id, value = predicted rating (≈1–10).
+    """
     if user_id not in user_item.index:
         raise ValueError(f"user_id {user_id} not in model.")
 
@@ -174,9 +174,14 @@ def get_item_based_cf_scores(user_id: int, k_neighbors: int = 20) -> pd.Series:
 
 def get_content_based_scores(
     user_id: int,
-    like_threshold: float = 5.0,
+    like_threshold: float = 7.0,
 ) -> pd.Series:
-
+    """
+    Content-based on genres + type.
+    Build a user profile from liked anime, then compute cosine similarity
+    between profile and all anime feature vectors.
+    Returns a Series: index = anime_id, value = similarity score.
+    """
     if user_id not in user_item.index:
         raise ValueError(f"user_id {user_id} not in model.")
 
@@ -235,7 +240,11 @@ def recommend_hybrid(
     alpha: float = 0.5,
     k_neighbors: int = 20,
 ) -> pd.DataFrame:
-
+    """
+    Weighted hybrid:
+    hybrid_score = alpha * normalized_CF + (1 - alpha) * normalized_content
+    Then scaled to [0,5] for output.
+    """
     cf_scores = get_item_based_cf_scores(user_id, k_neighbors=k_neighbors)
     cb_scores = get_content_based_scores(user_id)
 
@@ -259,26 +268,206 @@ def recommend_hybrid(
     return result.reset_index().rename(columns={"index": "anime_id"})
 
 
-def recommend_nmf_ai(
+# =========================================
+# AI-BASED APPROACH (CHAPTER 7: NCF)
+# =========================================
+
+class RatingsDataset(Dataset):
+    def __init__(self, user_indices, item_indices, ratings_0_5):
+        self.user_indices = user_indices
+        self.item_indices = item_indices
+        self.ratings_0_5 = ratings_0_5
+
+    def __len__(self):
+        return len(self.ratings_0_5)
+
+    def __getitem__(self, idx):
+        return (
+            self.user_indices[idx],
+            self.item_indices[idx],
+            self.ratings_0_5[idx],
+        )
+
+
+class NCF(nn.Module):
+    """
+    Neural Collaborative Filtering model:
+    - User & item embeddings
+    - MLP on concatenated embeddings
+    - Sigmoid output, scaled to [0,5]
+    """
+
+    def __init__(self, n_users, n_items, embed_dim=32, hidden_dims=(64, 32)):
+        super().__init__()
+        self.user_emb = nn.Embedding(n_users, embed_dim)
+        self.item_emb = nn.Embedding(n_items, embed_dim)
+
+        layers = []
+        input_dim = 2 * embed_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(input_dim, h))
+            layers.append(nn.ReLU())
+            input_dim = h
+        self.mlp = nn.Sequential(*layers)
+
+        self.out = nn.Linear(input_dim, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, user_idx, item_idx):
+        # user_idx, item_idx: LongTensor [batch]
+        u = self.user_emb(user_idx)
+        i = self.item_emb(item_idx)
+        x = torch.cat([u, i], dim=-1)
+        h = self.mlp(x)
+        logit = self.out(h)
+        score_0_5 = self.sigmoid(logit) * 5.0  # [0,5]
+        return score_0_5.squeeze(-1)
+
+
+def build_ncf_training_data(ratings_df, max_users=None, max_items=None):
+    """
+    ratings_df: DataFrame with columns [user_id, anime_id, rating]
+    Optionally limit to first max_users / max_items (for faster training).
+    """
+    df = ratings_df.copy()
+
+    if max_users is not None:
+        top_users = df["user_id"].value_counts().head(max_users).index
+        df = df[df["user_id"].isin(top_users)]
+
+    if max_items is not None:
+        top_items = df["anime_id"].value_counts().head(max_items).index
+        df = df[df["anime_id"].isin(top_items)]
+
+    unique_users = df["user_id"].unique()
+    unique_items = df["anime_id"].unique()
+
+    user2idx = {u: idx for idx, u in enumerate(unique_users)}
+    item2idx = {i: idx for idx, i in enumerate(unique_items)}
+
+    user_idx = df["user_id"].map(user2idx).values.astype("int64")
+    item_idx = df["anime_id"].map(item2idx).values.astype("int64")
+
+    # Target ratings in [0,5]
+    ratings_0_5 = (df["rating"].values.astype("float32") / 2.0).clip(0.0, 5.0)
+
+    dataset = RatingsDataset(
+        torch.from_numpy(user_idx),
+        torch.from_numpy(item_idx),
+        torch.from_numpy(ratings_0_5),
+    )
+
+    return dataset, user2idx, item2idx
+
+
+def train_ncf_model(
+    ratings_df,
+    n_epochs=3,
+    batch_size=2048,
+    embed_dim=32,
+    hidden_dims=(64, 32),
+    lr=1e-3,
+    max_users=2000,
+    max_items=3000,
+):
+    dataset, user2idx, item2idx = build_ncf_training_data(
+        ratings_df,
+        max_users=max_users,
+        max_items=max_items,
+    )
+
+    n_users = len(user2idx)
+    n_items = len(item2idx)
+
+    model = NCF(n_users, n_items, embed_dim=embed_dim, hidden_dims=hidden_dims).to(device)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    model.train()
+    for epoch in range(n_epochs):
+        running_loss = 0.0
+        for u, i, r in loader:
+            u = u.to(device)
+            i = i.to(device)
+            r = r.to(device)
+
+            optimizer.zero_grad()
+            preds = model(u, i)
+            loss = loss_fn(preds, r)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * len(r)
+
+        epoch_loss = running_loss / len(dataset)
+        print(f"[NCF] Epoch {epoch+1}/{n_epochs} - MSE loss: {epoch_loss:.4f}")
+
+    return model, user2idx, item2idx
+
+
+@st.cache_resource(show_spinner="Training AI-based model (Neural CF / Chap. 7)...")
+def get_trained_ncf_model(ratings_df):
+    model, user2idx, item2idx = train_ncf_model(
+        ratings_df,
+        n_epochs=3,
+        batch_size=2048,
+        embed_dim=32,
+        hidden_dims=(64, 32),
+        lr=1e-3,
+        max_users=2000,
+        max_items=3000,
+    )
+    return model, user2idx, item2idx
+
+
+ncf_model, ncf_user2idx, ncf_item2idx = get_trained_ncf_model(rating_filtered)
+
+
+def recommend_ai_ncf(
     user_id: int,
     top_n: int = 10,
 ) -> pd.DataFrame:
+    """
+    AI-based approach (Chap. 7):
+    Neural Collaborative Filtering with embeddings + MLP.
+    Output scores are already in [0,5].
+    """
+    if user_id not in user_item.index:
+        raise ValueError(f"user_id {user_id} not found in CF data.")
 
-    if user_id not in nmf_pred.index:
-        raise ValueError(f"user_id {user_id} not in NMF model.")
+    if user_id not in ncf_user2idx:
+        # User not seen during training → return empty result
+        return pd.DataFrame(columns=["anime_id", "name", "genre", "type", "score_0_5"])
 
-    preds = nmf_pred.loc[user_id]
+    user_idx = ncf_user2idx[user_id]
 
     user_ratings_row = user_item.loc[user_id]
     rated_items = user_ratings_row[user_ratings_row.notna()].index
 
-    # Remove seen items
-    preds = preds.drop(rated_items, errors="ignore")
+    # Candidates = items not yet rated by the user AND known to the NCF model
+    all_items = user_item.columns
+    candidates = [aid for aid in all_items if (aid not in rated_items and aid in ncf_item2idx)]
 
-    # Rescale to [0,5]
-    preds_0_5 = np.clip(preds / 2.0, 0.0, 5.0)
+    if not candidates:
+        return pd.DataFrame(columns=["anime_id", "name", "genre", "type", "score_0_5"])
 
-    top = preds_0_5.sort_values(ascending=False).head(top_n)
+    user_tensor = torch.tensor(
+        [user_idx] * len(candidates),
+        dtype=torch.long,
+        device=device,
+    )
+    item_tensor = torch.tensor(
+        [ncf_item2idx[aid] for aid in candidates],
+        dtype=torch.long,
+        device=device,
+    )
+
+    ncf_model.eval()
+    with torch.no_grad():
+        scores = ncf_model(user_tensor, item_tensor).cpu().numpy()  # already [0,5]
+
+    score_series = pd.Series(scores, index=candidates)
+    top = score_series.sort_values(ascending=False).head(top_n)
 
     result = anime_lookup.loc[top.index].copy()
     result["score_0_5"] = top.values
@@ -286,7 +475,13 @@ def recommend_nmf_ai(
     return result.reset_index().rename(columns={"index": "anime_id"})
 
 
-# --------- STREAMLIT UI LAYOUT ---------
+# =========================================
+# STREAMLIT UI
+# =========================================
+
+# Restrict user selection to users seen by BOTH CF and NCF
+available_user_ids = sorted(set(user_item.index).intersection(ncf_user2idx.keys()))
+
 st.title("🎌 Anime Recommendation System")
 
 st.sidebar.header("⚙️ Navigation & Settings")
@@ -310,7 +505,7 @@ n_recs = st.sidebar.slider(
     step=1,
 )
 
-# --------- PAGE 1: OVERVIEW (Landing page with mini visualisation) ---------
+# --------- PAGE 1: OVERVIEW ---------
 if page == "Overview":
     st.subheader("📊 Dataset Overview")
 
@@ -327,7 +522,6 @@ if page == "Overview":
     st.bar_chart(ratings_hist)
 
     st.markdown("### Top 10 genres (by number of anime)")
-    # Split and explode genres
     genre_series = (
         anime_small["genre"]
         .dropna()
@@ -355,12 +549,12 @@ if page == "Overview":
     st.markdown(
         """
 This overview page gives a quick visual summary of the anime dataset:
-- Ratings distribution
-- Most frequent genres
-- Average rating per anime type (TV, Movie, OVA, ...)
+- Ratings distribution  
+- Most frequent genres  
+- Average rating per type (TV, Movie, OVA, ...)
 
-Use the **Recommendations** page to see personalized lists, and the
-**Comparison** page to compare the hybrid vs AI-based approach.
+Use the **Recommendations** page to see personalised lists, and the
+**Comparison** page to compare the hybrid vs AI-based (Neural CF, Chap. 7) models.
 """
     )
 
@@ -370,7 +564,7 @@ elif page == "Recommendations":
         "Recommendation approach",
         (
             "Hybrid (item-CF + content, weighted)",
-            "AI-based (latent factor model - NMF)",
+            "AI-based (Neural Collaborative Filtering)",
         ),
     )
 
@@ -401,7 +595,7 @@ elif page == "Recommendations":
                 k_neighbors=k_neighbors,
             )
 
-        st.write("Top recommended anime:")
+        st.write("Top recommended anime (Hybrid):")
         st.dataframe(
             recs[["anime_id", "name", "genre", "type", "score_0_5"]]
             .reset_index(drop=True)
@@ -409,19 +603,22 @@ elif page == "Recommendations":
 
     else:
         st.subheader(
-            f"AI-based recommendations (latent factors / NMF) for user {selected_user} (scores in [0,5])"
+            f"AI-based recommendations (Neural CF, Chap. 7) for user {selected_user} (scores in [0,5])"
         )
-        with st.spinner("Computing NMF-based recommendations..."):
-            recs = recommend_nmf_ai(
+        with st.spinner("Computing Neural CF recommendations..."):
+            recs = recommend_ai_ncf(
                 user_id=selected_user,
                 top_n=n_recs,
             )
 
-        st.write("Top recommended anime:")
-        st.dataframe(
-            recs[["anime_id", "name", "genre", "type", "score_0_5"]]
-            .reset_index(drop=True)
-        )
+        if recs.empty:
+            st.info("No AI-based recommendations available for this user.")
+        else:
+            st.write("Top recommended anime (AI-based Neural CF):")
+            st.dataframe(
+                recs[["anime_id", "name", "genre", "type", "score_0_5"]]
+                .reset_index(drop=True)
+            )
 
     st.markdown("---")
     st.subheader(f"📖 Rating history for user {selected_user} (sample)")
@@ -440,7 +637,7 @@ elif page == "Recommendations":
 # --------- PAGE 3: COMPARISON ---------
 elif page == "Comparison":
     st.subheader(
-        f"Comparison: Hybrid vs AI-based (scores in [0,5]) for user {selected_user}"
+        f"Comparison: Hybrid vs AI-based (Neural CF, Chap. 7) for user {selected_user}"
     )
 
     # Settings specific to hybrid for the comparison
@@ -466,7 +663,7 @@ elif page == "Comparison":
             alpha=alpha_cmp,
             k_neighbors=k_neighbors_cmp,
         )
-        ai_recs = recommend_nmf_ai(
+        ai_recs = recommend_ai_ncf(
             user_id=selected_user,
             top_n=n_recs,
         )
@@ -482,12 +679,15 @@ elif page == "Comparison":
         )
 
     with col2:
-        st.markdown("### AI-based recommendations (NMF)")
-        st.dataframe(
-            ai_recs[["anime_id", "name", "genre", "type", "score_0_5"]]
-            .rename(columns={"score_0_5": "ai_score"})
-            .reset_index(drop=True)
-        )
+        st.markdown("### AI-based recommendations (Neural CF)")
+        if ai_recs.empty:
+            st.info("No AI-based recommendations available for this user.")
+        else:
+            st.dataframe(
+                ai_recs[["anime_id", "name", "genre", "type", "score_0_5"]]
+                .rename(columns={"score_0_5": "ai_score"})
+                .reset_index(drop=True)
+            )
 
     # Compare overlapping recommendations (same anime recommended by both)
     st.markdown("---")
@@ -519,10 +719,11 @@ elif page == "Comparison":
 
     st.markdown(
         """
-On this page you can:
-- See the **two lists** side by side.
-- Inspect which anime appears in **both top-N lists**, and how their scores differ.
-This is a nice way to discuss the behaviour of a **hybrid** vs an **AI-based (latent factor)**
-approach in your report / presentation.
+The comparison page lets you:
+- See the two lists side by side  
+- Inspect which anime appear in both lists and how the scores differ  
+
+This directly illustrates the difference between a **hybrid (item-CF + content)** system
+and an **AI-based (Neural Collaborative Filtering, Chapter 7)** model.
 """
     )
