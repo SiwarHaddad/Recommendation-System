@@ -2,10 +2,10 @@
 
 A small anime recommendation system built with Python and Streamlit using:
 
-* a **hybrid model**: item–item collaborative filtering + content-based filtering (genres + type)
-* an **AI-based model**: latent factor model with **NMF**
+* a **hybrid approach**: item–item collaborative filtering + content-based filtering (genres + type)
+* an **AI-based approach**: Neural Collaborative Filtering **NCF** model
 
-Both models output scores normalised to **[0,5]**.
+Both approaches output scores normalised to **[0,5]**.
 
 ---
 
@@ -39,8 +39,8 @@ Then open `http://localhost:8501` in your browser.
 ## 🧱 Features
 
 * **Overview**: basic stats and visualisations of the dataset
-* **Recommendations**: personalised recommendations (Hybrid or NMF)
-* **Comparison**: side-by-side comparison of the two models and their scores
+* **Recommendations**: personalised recommendations (Hybrid or NCF)
+* **Comparison**: side-by-side comparison of the two approaches and their scores
 
 ---
 
