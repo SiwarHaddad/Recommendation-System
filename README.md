@@ -3,7 +3,7 @@
 A small anime recommendation system built with Python and Streamlit using:
 
 * a **hybrid approach**: item–item collaborative filtering + content-based filtering (genres + type)
-* an **AI-based approach**: Neural Collaborative Filtering **NCF** model
+* an **AI-based approach**: Neural Collaborative Filtering (**NCF**) model
 
 Both approaches output scores normalised to **[0,5]**.
 
