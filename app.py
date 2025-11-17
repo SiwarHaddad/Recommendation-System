@@ -269,7 +269,7 @@ def recommend_hybrid(
 
 
 # =========================================
-# AI-BASED APPROACH (CHAPTER 7: NCF)
+# AI-BASED APPROACH 
 # =========================================
 
 class RatingsDataset(Dataset):
@@ -724,6 +724,6 @@ The comparison page lets you:
 - Inspect which anime appear in both lists and how the scores differ  
 
 This directly illustrates the difference between a **hybrid (item-CF + content)** system
-and an **AI-based (Neural Collaborative Filtering, Chapter 7)** model.
+and an **AI-based (Neural Collaborative Filtering)** model.
 """
     )
